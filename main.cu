@@ -289,7 +289,7 @@ int main()
   const int tile_size = items_per_thread * block_threads;
 
   const auto input = Input<std::uint32_t, std::uint32_t>(
-    gen_uniform_buffer_sizes<std::uint32_t>(128 * 1024, 2 * tile_size));
+    gen_uniform_buffer_sizes<std::uint32_t>(32 * 1024, 2 * tile_size));
 
   // 1024 * 1024 buffers of 256 elements => 46%
   // 1024 buffers of 1024 * 1024 elements => 78%

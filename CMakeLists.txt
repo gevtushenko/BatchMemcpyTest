@@ -11,3 +11,6 @@ set_target_properties(BatchMemcpyTest PROPERTIES
 target_include_directories(BatchMemcpyTest PRIVATE
         C:/Users/evtus/Documents/GitHub/senior-zero/cub
         C:/Users/evtus/Documents/GitHub/senior-zero/thrust)
+
+#target_compile_options(BatchMemcpyTest PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
