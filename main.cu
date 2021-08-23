@@ -3,7 +3,11 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
+#include "cub/iterator/cache_modified_input_iterator.cuh"
+#include "cub/iterator/cache_modified_output_iterator.cuh"
 #include "cub/device/device_batch_memcpy.cuh"
+#include "cub/block/block_load.cuh"
+#include "cub/block/block_store.cuh"
 
 
 float get_max_bw(int dev = 0)
@@ -29,8 +33,8 @@ class Input
   const std::size_t buffers {};
   std::size_t total_input_size {};
 
-  thrust::device_vector<DataT> input;
-  thrust::device_vector<DataT> output;
+  mutable thrust::device_vector<DataT> input;
+  mutable thrust::device_vector<DataT> output;
 
   thrust::device_vector<void*> in_pointers;
   thrust::device_vector<void*> out_pointers;
@@ -71,6 +75,24 @@ public:
     buffer_sizes = h_buffer_sizes;
   }
 
+  void fill_input(DataT value) const
+  {
+    thrust::fill(input.begin(), input.end(), value);
+  }
+
+  void fill_output(DataT value) const
+  {
+    thrust::fill(output.begin(), output.end(), value);
+  }
+
+  void compare() const
+  {
+    if (output != input)
+    {
+      throw std::runtime_error("Wrong result!");
+    }
+  }
+
   std::size_t get_bytes_read() const
   {
     return total_input_size * sizeof(DataT);
@@ -103,7 +125,7 @@ public:
 
   float bytes_to_gb(std::size_t bytes) const
   {
-    return static_cast<float>(bytes / 1024 / 1024 / 1024);
+    return static_cast<float>(bytes) / 1024.0f / 1024.0f / 1024.0f;
   }
 
   float get_bw(float ms) const
@@ -141,6 +163,9 @@ void measure_cub(const Input<DataT, OffsetT> &input)
   thrust::device_vector<std::uint8_t> temp_storage(temp_storage_bytes);
   std::uint8_t *d_temp_storage = thrust::raw_pointer_cast(temp_storage.data());
 
+  input.fill_input(DataT{42});
+  input.fill_output(DataT{1});
+
   cudaEvent_t begin, end;
   cudaEventCreate(&begin);
   cudaEventCreate(&end);
@@ -160,15 +185,117 @@ void measure_cub(const Input<DataT, OffsetT> &input)
   float ms {};
   cudaEventElapsedTime(&ms, begin, end);
 
+  input.compare();
+
   report_result(ms, input);
 
   cudaEventDestroy(end);
   cudaEventDestroy(begin);
 }
 
+
+template <int BlockThreads,
+          typename OffsetT>
+__launch_bounds__(BlockThreads)
+__global__ void naive_kernel(void **in_pointers,
+                             void **out_pointers,
+                             const OffsetT *sizes)
+{
+  using underlying_type = std::uint32_t;
+
+  constexpr int items_per_thread = 4;
+  constexpr int tile_size = items_per_thread * BlockThreads;
+
+  using BlockLoadT =
+    cub::BlockLoad<underlying_type,
+                   BlockThreads,
+                   items_per_thread,
+                   cub::BlockLoadAlgorithm::BLOCK_LOAD_VECTORIZE>;
+
+  using BlockStoreT =
+    cub::BlockStore<underlying_type,
+                    BlockThreads,
+                    items_per_thread,
+                    cub::BlockStoreAlgorithm::BLOCK_STORE_VECTORIZE>;
+
+  __shared__ union
+  {
+    typename BlockLoadT::TempStorage load;
+    typename BlockStoreT::TempStorage store;
+
+  } storage;
+
+  const int buffer_id = blockIdx.x;
+  auto in = reinterpret_cast<underlying_type*>(in_pointers[buffer_id]);
+  auto out = reinterpret_cast<underlying_type*>(out_pointers[buffer_id]);
+  const auto size = sizes[buffer_id];
+  const auto size_in_elements = size / sizeof(underlying_type);
+  const auto tiles = size_in_elements / tile_size;
+
+  for (std::size_t tile = 0; tile < tiles; tile++)
+  {
+    cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
+    cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
+
+    underlying_type thread_data[items_per_thread];
+    BlockLoadT(storage.load).Load(in_iterator, thread_data);
+    BlockStoreT(storage.store).Store(out_iterator, thread_data);
+
+    in += tile_size;
+    out += tile_size;
+  }
+}
+
+
+template <typename DataT,
+          typename OffsetT>
+void measure_naive(const Input<DataT, OffsetT> &input)
+{
+  cudaEvent_t begin, end;
+  cudaEventCreate(&begin);
+  cudaEventCreate(&end);
+
+  input.fill_input(DataT{24});
+  input.fill_output(DataT{1});
+
+  cudaEventRecord(begin);
+
+  constexpr int block_threads = 128;
+  naive_kernel<block_threads, OffsetT>
+    <<<input.get_num_buffers(), block_threads>>>(
+      input.get_input(),
+      input.get_output(),
+      input.get_buffer_sizes());
+
+  cudaEventRecord(end);
+  cudaEventSynchronize(end);
+
+  float ms {};
+  cudaEventElapsedTime(&ms, begin, end);
+
+  input.compare();
+
+  report_result(ms, input);
+
+  cudaEventDestroy(end);
+  cudaEventDestroy(begin);
+}
+
+
 int main()
 {
-  measure_cub(Input<std::uint64_t, std::uint32_t>(
-    gen_uniform_buffer_sizes<std::uint32_t>(1024, 1024 * 1024)));
+  const int items_per_thread = 4;
+  const int block_threads = 128;
+  const int tile_size = items_per_thread * block_threads;
+
+  const auto input = Input<std::uint32_t, std::uint32_t>(
+    gen_uniform_buffer_sizes<std::uint32_t>(128 * 1024, 2 * tile_size));
+
+  // 1024 * 1024 buffers of 256 elements => 46%
+  // 1024 buffers of 1024 * 1024 elements => 78%
+  // 2 buffers of 256 * 1024 * 1024 elements => 79%
+  measure_cub(input);
+  measure_naive(input);
+
   return 0;
 }
