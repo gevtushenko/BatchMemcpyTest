@@ -113,6 +113,16 @@ public:
     return const_cast<void**>(thrust::raw_pointer_cast(out_pointers.data()));
   }
 
+  void* get_input_raw() const
+  {
+    return const_cast<DataT*>(thrust::raw_pointer_cast(input.data()));
+  }
+
+  void* get_output_raw() const
+  {
+    return const_cast<DataT*>(thrust::raw_pointer_cast(output.data()));
+  }
+
   const OffsetT* get_buffer_sizes() const
   {
     return thrust::raw_pointer_cast(buffer_sizes.data());
@@ -341,7 +351,7 @@ __global__ void large_kernel(
   {
     for (std::size_t tile = 0; tile < tiles_per_request; tile++)
     {
-      if (tile + tiles_copied > tiles)
+      if (tile + tiles_copied >= tiles)
       {
         break;
       }
@@ -434,6 +444,39 @@ void measure_large(const Input<DataT, OffsetT> &input)
 }
 
 
+template <typename DataT,
+          typename OffsetT>
+void measure_memcpy(const Input<DataT, OffsetT> &input)
+{
+  cudaEvent_t begin, end;
+  cudaEventCreate(&begin);
+  cudaEventCreate(&end);
+
+
+  input.fill_input(DataT{24});
+  input.fill_output(DataT{1});
+
+  cudaEventRecord(begin);
+
+  cudaMemcpyAsync(input.get_output_raw(),
+                  input.get_input_raw(),
+                  input.get_bytes_written(),
+                  cudaMemcpyDeviceToDevice);
+
+  cudaEventRecord(end);
+  cudaEventSynchronize(end);
+
+  float ms{};
+  cudaEventElapsedTime(&ms, begin, end);
+
+  input.compare();
+
+  report_result(ms, input);
+
+    cudaEventDestroy(end);
+    cudaEventDestroy(begin);
+  }
+
 int main()
 {
   const int items_per_thread = 4;
@@ -441,7 +484,7 @@ int main()
   const int tile_size = items_per_thread * block_threads;
 
   const auto input = Input<std::uint32_t, std::uint32_t>(
-    gen_uniform_buffer_sizes<std::uint32_t>(2, 32 * 1024 * tile_size));
+    gen_uniform_buffer_sizes<std::uint32_t>(9, 32 * 1024 * tile_size));
 
   // 1024 * 1024 buffers of 256 elements => 46%
   // 1024 buffers of 1024 * 1024 elements => 78%
@@ -449,6 +492,7 @@ int main()
   measure_cub(input);
   measure_naive(input);
   measure_large(input);
+  measure_memcpy(input);
 
   return 0;
 }
