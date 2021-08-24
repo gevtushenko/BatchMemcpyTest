@@ -882,14 +882,16 @@ void measure_partition(const Input<DataT, OffsetT> &input)
 
 int main()
 {
-  const auto input = Input<std::uint64_t, std::uint32_t>(
+  const auto input = Input<std::uint32_t, std::uint32_t>(
     gen_shuffled_buffer_sizes<std::uint32_t>(
-      1024 * 1024, // small
+      2 * 1024 * 1024, // small
       0, // medium
-      4, // large,
-      2,
+      0, // large,
+      1,
       256, // 256 * 4
       32 * 1024 * 1024));
+
+  std::cout << "Generation complete" << std::endl;
 
   // 1024 * 1024 buffers of 256 elements => 46%
   // 1024 buffers of 1024 * 1024 elements => 78%
