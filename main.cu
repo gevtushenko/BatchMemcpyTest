@@ -2,6 +2,7 @@
 
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
+#include <thrust/shuffle.h>
 
 #include "cub/device/device_partition.cuh"
 #include "cub/iterator/cache_modified_input_iterator.cuh"
@@ -27,6 +28,27 @@ thrust::host_vector<T> gen_uniform_buffer_sizes(std::size_t buffers,
                                                 std::size_t buffer_size)
 {
   thrust::host_vector<T> sizes(buffers, buffer_size);
+  return sizes;
+}
+
+template <typename T>
+thrust::host_vector<T> gen_shuffled_buffer_sizes(std::size_t small_buffers,
+                                                 std::size_t medium_buffers,
+                                                 std::size_t large_buffers,
+                                                 std::size_t small_buffer_size,
+                                                 std::size_t medium_buffer_size,
+                                                 std::size_t large_buffer_size)
+{
+  const std::size_t total_buffers = small_buffers + medium_buffers + large_buffers;
+  thrust::host_vector<T> sizes(total_buffers);
+
+  thrust::fill_n(sizes.begin(), small_buffers, small_buffer_size);
+  thrust::fill_n(sizes.begin() + small_buffers, medium_buffers, medium_buffer_size);
+  thrust::fill_n(sizes.begin() + small_buffers + medium_buffers, large_buffers, large_buffer_size);
+
+  thrust::default_random_engine re;
+  thrust::shuffle(sizes.begin(), sizes.end(), re);
+
   return sizes;
 }
 
@@ -822,12 +844,14 @@ void measure_partition(const Input<DataT, OffsetT> &input)
 
 int main()
 {
-  const int items_per_thread = 4;
-  const int block_threads = 256;
-  const int tile_size = items_per_thread * block_threads;
-
   const auto input = Input<std::uint32_t, std::uint32_t>(
-    gen_uniform_buffer_sizes<std::uint32_t>(1024 * 1024, 32));
+    gen_shuffled_buffer_sizes<std::uint32_t>(
+      1024 * 256, // small
+      1024 * 32, // medium
+      9, // large,
+      96,
+      256 * 4 * 16,
+      32 * 1024 * 1024));
 
   // 1024 * 1024 buffers of 256 elements => 46%
   // 1024 buffers of 1024 * 1024 elements => 78%
