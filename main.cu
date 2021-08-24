@@ -630,10 +630,16 @@ template <typename          InputT,
     auto in = reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
     auto out = reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
     const auto size             = sizes[buffer_id];
-    const auto size_in_elements = size / sizeof(underlying_type);
-    const auto tiles            = size_in_elements / tile_size;
 
-    for (std::size_t tile = 0; tile < tiles; tile++)
+    if (size == 0)
+    {
+      continue;
+    }
+
+    const auto size_in_elements = size / sizeof(underlying_type);
+    const auto tiles            = (size_in_elements + tile_size - 1) / tile_size;
+
+    for (std::size_t tile = 0; tile < tiles - 1; tile++)
     {
       cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
       cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
@@ -645,6 +651,15 @@ template <typename          InputT,
       in += tile_size;
       out += tile_size;
     }
+
+    const int valid_items = size_in_elements - (tiles - 1) * tile_size;
+
+    cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
+    cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
+
+    underlying_type thread_data[items_per_thread];
+    BlockLoadT(storage.block_load).Load(in_iterator, thread_data, valid_items);
+    BlockStoreT(storage.block_store).Store(out_iterator, thread_data, valid_items);
   }
 
   if (large_buffers > 0)
@@ -740,9 +755,9 @@ template <typename          InputT,
     auto out = reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
     const auto size             = sizes[buffer_id];
     const auto size_in_elements = size / sizeof(underlying_type);
-    const auto tiles            = size_in_elements / warp_tile_size;
+    const auto tiles            = (size_in_elements + warp_tile_size - 1) / warp_tile_size;
 
-    for (std::size_t tile = 0; tile < tiles; tile++)
+    for (std::size_t tile = 0; tile < tiles - 1; tile++)
     {
       cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
       cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
@@ -754,6 +769,15 @@ template <typename          InputT,
       in += warp_tile_size;
       out += warp_tile_size;
     }
+
+    cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
+    cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
+
+    const int valid_items = size_in_elements - (tiles - 1) * warp_tile_size;
+
+    underlying_type thread_data[items_per_thread];
+    WarpLoadT(storage.warp_load).Load(in_iterator, thread_data, valid_items);
+    WarpStoreT(storage.warp_store).Store(out_iterator, thread_data, valid_items);
   }
 }
 
@@ -873,10 +897,10 @@ int main()
 {
   const auto input = Input<std::uint32_t, std::uint32_t>(
     gen_shuffled_buffer_sizes<std::uint32_t>(
-      0, // small
+      1024 * 128, // small
       0, // medium
       300, // large,
-      96,
+      4 * 4 * 8,
       256 * 4 * 16,
       2 * 1024 * 1024));
 
