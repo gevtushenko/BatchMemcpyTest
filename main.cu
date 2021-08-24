@@ -941,14 +941,25 @@ float measure_partition(const Input<DataT, OffsetT> &input)
 }
 
 
-int main()
+template <typename DataT,
+          typename OffsetT>
+void measure()
 {
+  const std::size_t buffer_size = 256;
+
   for (std::size_t power_of_two = 12; power_of_two < 28; power_of_two += 2)
   {
     const std::size_t buffers = 1ull << power_of_two;
+    const float gb = static_cast<float>((buffers * buffer_size) * sizeof(DataT)) / 1024 / 1024 / 1024;
 
-    const auto input = Input<std::uint64_t, std::uint32_t>(
-      gen_uniform_buffer_sizes<std::uint32_t>(buffers, 8));
+    if (gb > 12)
+      break;
+
+    std::cout << gb << ", ";
+    std::cout.flush();
+
+    const auto input = Input<DataT, OffsetT>(
+    gen_uniform_buffer_sizes<OffsetT>(buffers, buffer_size));
 
     const float partition_ms = measure_partition(input);
     const float cub_ms = measure_cub(input);
@@ -956,7 +967,12 @@ int main()
 
     std::cout << memcpy_ms << ", " << cub_ms << ", " << partition_ms << std::endl;
   }
+}
 
+
+int main()
+{
+  measure<std::uint64_t, std::uint32_t>();
 
   /*
   const auto input = Input<std::uint32_t, std::uint32_t>(
