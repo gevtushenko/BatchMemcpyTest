@@ -330,51 +330,61 @@ __global__ void large_kernel(
 
   } storage;
 
-  const int buffer_id =
-    large_buffers_reordering[static_cast<int>(blockIdx.x) % large_buffers];
-
-  auto in_origin = reinterpret_cast<underlying_type*>(in_pointers[buffer_id]);
-  auto out_origin = reinterpret_cast<underlying_type*>(out_pointers[buffer_id]);
-  const auto size = sizes[buffer_id];
-  const auto size_in_elements = size / sizeof(underlying_type);
-  const auto tiles = size_in_elements / tile_size;
-
-  __shared__ int tiles_copied_cache;
-
-  if (threadIdx.x == 0)
+  for (unsigned int bid = blockIdx.x % large_buffers; bid < large_buffers; bid += gridDim.x)
   {
-    tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id, tiles_per_request);
-  }
-  __syncthreads();
-  int tiles_copied = tiles_copied_cache;
+    const int buffer_id = large_buffers_reordering[bid];
 
-  while(tiles_copied < tiles)
-  {
-    for (std::size_t tile = 0; tile < tiles_per_request; tile++)
-    {
-      if (tile + tiles_copied >= tiles)
-      {
-        break;
-      }
+    auto in_origin =
+      reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
+    auto out_origin =
+      reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
+    const auto size             = sizes[buffer_id];
+    const auto size_in_elements = size / sizeof(underlying_type);
+    const auto tiles            = size_in_elements / tile_size;
 
-      const OffsetT tile_offset = (tile + tiles_copied) * tile_size;
-      const auto in = in_origin + tile_offset;
-      const auto out = out_origin + tile_offset;
-
-      cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
-      cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
-
-      underlying_type thread_data[items_per_thread];
-      BlockLoadT(storage.load).Load(in_iterator, thread_data);
-      BlockStoreT(storage.store).Store(out_iterator, thread_data);
-    }
+    __shared__ int tiles_copied_cache;
 
     if (threadIdx.x == 0)
     {
-      tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id, tiles_per_request);
+      tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+                                     tiles_per_request);
     }
     __syncthreads();
-    tiles_copied = tiles_copied_cache;
+    int tiles_copied = tiles_copied_cache;
+
+    while (tiles_copied < tiles)
+    {
+      for (std::size_t tile = 0; tile < tiles_per_request; tile++)
+      {
+        if (tile + tiles_copied >= tiles)
+        {
+          break;
+        }
+
+        const OffsetT tile_offset = (tile + tiles_copied) * tile_size;
+        const auto in             = in_origin + tile_offset;
+        const auto out            = out_origin + tile_offset;
+
+        cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS,
+                                        underlying_type>
+          in_iterator(in);
+        cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS,
+                                         underlying_type>
+          out_iterator(out);
+
+        underlying_type thread_data[items_per_thread];
+        BlockLoadT(storage.load).Load(in_iterator, thread_data);
+        BlockStoreT(storage.store).Store(out_iterator, thread_data);
+      }
+
+      if (threadIdx.x == 0)
+      {
+        tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+                                       tiles_per_request);
+      }
+      __syncthreads();
+      tiles_copied = tiles_copied_cache;
+    }
   }
 }
 
@@ -522,11 +532,14 @@ struct SmallSegmentsSelectorT
 
 template <int BlockThreads,
           typename LargeBuffersReorderingT,
+          typename MediumBuffersReorderingT,
           typename OffsetT>
 __launch_bounds__(BlockThreads)
 __global__ void partitioned_kernel(
-  int large_buffers,
+  int num_buffers,
+  const int *d_group_sizes,
   LargeBuffersReorderingT large_buffers_reordering,
+  MediumBuffersReorderingT medium_buffers_reordering,
   int *tiles_copied_ptr,
 
   void **in_pointers,
@@ -534,6 +547,10 @@ __global__ void partitioned_kernel(
   const OffsetT *sizes)
 {
   using underlying_type = std::uint32_t;
+
+  const unsigned int large_buffers = d_group_sizes[0];
+  const unsigned int small_buffers = d_group_sizes[1];
+  const unsigned int medium_buffers = num_buffers - large_buffers - small_buffers;
 
   constexpr int items_per_thread  = 4;
   constexpr int tile_size         = items_per_thread * BlockThreads;
@@ -558,63 +575,89 @@ __global__ void partitioned_kernel(
 
   } storage;
 
-  const int buffer_id =
-    large_buffers_reordering[static_cast<int>(blockIdx.x) % large_buffers];
 
-  auto in_origin = reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
-  auto out_origin =
-    reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
-  const auto size             = sizes[buffer_id];
-  const auto size_in_elements = size / sizeof(underlying_type);
-  const auto tiles            = size_in_elements / tile_size;
-
-  __shared__ int tiles_copied_cache;
-
-  if (threadIdx.x == 0)
+  for (unsigned int bid = blockIdx.x; bid < medium_buffers; bid += gridDim.x)
   {
-    tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
-                                   tiles_per_request);
-  }
-  __syncthreads();
-  int tiles_copied = tiles_copied_cache;
+    const int buffer_id = bid; // medium_buffers_reordering[bid];
 
-  while (tiles_copied < tiles)
-  {
-    for (std::size_t tile = 0; tile < tiles_per_request; tile++)
+    auto in = reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
+    auto out = reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
+    const auto size             = sizes[buffer_id];
+    const auto size_in_elements = size / sizeof(underlying_type);
+    const auto tiles            = size_in_elements / tile_size;
+
+    for (std::size_t tile = 0; tile < tiles; tile++)
     {
-      if (tile + tiles_copied >= tiles)
-      {
-        break;
-      }
-
-      const OffsetT tile_offset = (tile + tiles_copied) * tile_size;
-      const auto in             = in_origin + tile_offset;
-      const auto out            = out_origin + tile_offset;
-
-      cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS,
-                                      underlying_type>
-        in_iterator(in);
-      cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS,
-                                       underlying_type>
-        out_iterator(out);
+      cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
+      cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
 
       underlying_type thread_data[items_per_thread];
       BlockLoadT(storage.load).Load(in_iterator, thread_data);
       BlockStoreT(storage.store).Store(out_iterator, thread_data);
-    }
 
-    if (threadIdx.x == 0)
-    {
-      tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
-                                     tiles_per_request);
+      in += tile_size;
+      out += tile_size;
     }
-    __syncthreads();
-    tiles_copied = tiles_copied_cache;
+  }
+
+  if (large_buffers > 0)
+  {
+    for (unsigned int bid = blockIdx.x % large_buffers; bid < large_buffers; bid += gridDim.x)
+    {
+      const int buffer_id = large_buffers_reordering[bid];
+
+      auto in_origin = reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
+      auto out_origin = reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
+      const auto size             = sizes[buffer_id];
+      const auto size_in_elements = size / sizeof(underlying_type);
+      const auto tiles            = size_in_elements / tile_size;
+
+      __shared__ int tiles_copied_cache;
+
+      if (threadIdx.x == 0)
+      {
+        tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+                                       tiles_per_request);
+      }
+      __syncthreads();
+      int tiles_copied = tiles_copied_cache;
+
+      while (tiles_copied < tiles)
+      {
+        for (std::size_t tile = 0; tile < tiles_per_request; tile++)
+        {
+          if (tile + tiles_copied >= tiles)
+          {
+            break;
+          }
+
+          const OffsetT tile_offset = (tile + tiles_copied) * tile_size;
+          const auto in             = in_origin + tile_offset;
+          const auto out            = out_origin + tile_offset;
+
+          cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
+          cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
+
+          underlying_type thread_data[items_per_thread];
+          BlockLoadT(storage.load).Load(in_iterator, thread_data);
+          BlockStoreT(storage.store).Store(out_iterator, thread_data);
+        }
+
+        if (threadIdx.x == 0)
+        {
+          tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+                                         tiles_per_request);
+        }
+        __syncthreads();
+        tiles_copied = tiles_copied_cache;
+      }
+    }
   }
 }
 
+
 template <typename DataT,
-  typename OffsetT>
+          typename OffsetT>
 void measure_partition(const Input<DataT, OffsetT> &input)
 {
   const std::size_t num_buffers = input.get_num_buffers();
@@ -678,7 +721,7 @@ void measure_partition(const Input<DataT, OffsetT> &input)
   int max_occupancy;
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(
     &max_occupancy,
-    partitioned_kernel<block_threads, decltype(large), OffsetT>,
+    partitioned_kernel<block_threads, decltype(large), decltype(medium), OffsetT>,
     block_threads,
     0);
 
@@ -694,12 +737,14 @@ void measure_partition(const Input<DataT, OffsetT> &input)
                            medium,
                            d_group_sizes,
                            num_buffers,
-                           small_selector,
-                           large_selector);
+                           large_selector,
+                           small_selector);
 
-  partitioned_kernel<block_threads, decltype(large), OffsetT>
+  partitioned_kernel<block_threads>
     <<<grid_size, block_threads>>>(num_buffers,
+                                   d_group_sizes,
                                    large,
+                                   medium,
                                    d_queue_and_medium,
 
                                    input.get_input(),
@@ -728,14 +773,14 @@ int main()
   const int tile_size = items_per_thread * block_threads;
 
   const auto input = Input<std::uint32_t, std::uint32_t>(
-    gen_uniform_buffer_sizes<std::uint32_t>(9, 32 * 1024 * tile_size));
+    gen_uniform_buffer_sizes<std::uint32_t>(1024 * 1024, tile_size));
 
   // 1024 * 1024 buffers of 256 elements => 46%
   // 1024 buffers of 1024 * 1024 elements => 78%
   // 2 buffers of 256 * 1024 * 1024 elements => 79%
   measure_cub(input);
   measure_naive(input);
-  measure_large(input);
+  // measure_large(input);
   measure_memcpy(input);
 
   measure_partition(input);
