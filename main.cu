@@ -657,7 +657,7 @@ template <typename          InputT,
       auto out_origin = reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
       const auto size             = sizes[buffer_id];
       const auto size_in_elements = size / sizeof(underlying_type);
-      const auto tiles            = size_in_elements / tile_size;
+      const auto tiles            = (size_in_elements + tile_size - 1) / tile_size;
 
       __shared__ int tiles_copied_cache;
 
@@ -669,10 +669,18 @@ template <typename          InputT,
       __syncthreads();
       int tiles_copied = tiles_copied_cache;
 
+      bool process_last_tile = false;
+
       while (tiles_copied < tiles)
       {
         for (std::size_t tile = 0; tile < tiles_per_request; tile++)
         {
+          if (tile + tiles_copied == tiles - 1)
+          {
+            process_last_tile = true;
+            break;
+          }
+
           if (tile + tiles_copied >= tiles)
           {
             break;
@@ -690,13 +698,32 @@ template <typename          InputT,
           BlockStoreT(storage.block_store).Store(out_iterator, thread_data);
         }
 
-        if (threadIdx.x == 0)
+        if (process_last_tile)
         {
-          tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
-                                         tiles_per_request);
+          const OffsetT tile_offset = (tiles - 1) * tile_size;
+          const auto in = in_origin + tile_offset;
+          const auto out = out_origin + tile_offset;
+
+          const int valid_items = size_in_elements - (tiles - 1) * tile_size;
+
+          cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
+          cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
+
+          underlying_type thread_data[items_per_thread];
+          BlockLoadT(storage.block_load).Load(in_iterator, thread_data, valid_items);
+          BlockStoreT(storage.block_store).Store(out_iterator, thread_data, valid_items);
+          break;
         }
-        __syncthreads();
-        tiles_copied = tiles_copied_cache;
+        else
+        {
+          if (threadIdx.x == 0)
+          {
+            tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+                                           tiles_per_request);
+          }
+          __syncthreads();
+          tiles_copied = tiles_copied_cache;
+        }
       }
     }
   }
@@ -846,12 +873,12 @@ int main()
 {
   const auto input = Input<std::uint32_t, std::uint32_t>(
     gen_shuffled_buffer_sizes<std::uint32_t>(
-      1024 * 256, // small
-      1024 * 32, // medium
-      9, // large,
+      0, // small
+      0, // medium
+      300, // large,
       96,
       256 * 4 * 16,
-      32 * 1024 * 1024));
+      2 * 1024 * 1024));
 
   // 1024 * 1024 buffers of 256 elements => 46%
   // 1024 buffers of 1024 * 1024 elements => 78%
