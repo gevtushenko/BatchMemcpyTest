@@ -9,6 +9,8 @@
 #include "cub/device/device_batch_memcpy.cuh"
 #include "cub/block/block_load.cuh"
 #include "cub/block/block_store.cuh"
+#include "cub/warp/warp_load.cuh"
+#include "cub/warp/warp_store.cuh"
 
 
 float get_max_bw(int dev = 0)
@@ -540,6 +542,7 @@ __global__ void partitioned_kernel(
   const int *d_group_sizes,
   LargeBuffersReorderingT large_buffers_reordering,
   MediumBuffersReorderingT medium_buffers_reordering,
+  int *small_buffers_reordering,
   int *tiles_copied_ptr,
 
   void **in_pointers,
@@ -568,17 +571,39 @@ __global__ void partitioned_kernel(
                     items_per_thread,
                     cub::BlockStoreAlgorithm::BLOCK_STORE_VECTORIZE>;
 
+  constexpr int warp_size = 4;
+
+  /*
+   *
+template <typename          InputT,
+          int               ITEMS_PER_THREAD,
+          WarpLoadAlgorithm ALGORITHM            = WARP_LOAD_DIRECT,
+          int               LOGICAL_WARP_THREADS = CUB_PTX_WARP_THREADS,
+   */
+
+  using WarpLoadT = cub::WarpLoad<underlying_type,
+                                  items_per_thread,
+                                  cub::WarpLoadAlgorithm::WARP_LOAD_VECTORIZE,
+                                  warp_size>;
+  using WarpStoreT =
+    cub::WarpStore<underlying_type,
+                   items_per_thread,
+                   cub::WarpStoreAlgorithm::WARP_STORE_VECTORIZE,
+                   warp_size>;
+
   __shared__ union
   {
-    typename BlockLoadT::TempStorage load;
-    typename BlockStoreT::TempStorage store;
+    typename BlockLoadT::TempStorage block_load;
+    typename BlockStoreT::TempStorage block_store;
 
+    typename WarpLoadT::TempStorage warp_load;
+    typename WarpStoreT::TempStorage warp_store;
   } storage;
 
 
   for (unsigned int bid = blockIdx.x; bid < medium_buffers; bid += gridDim.x)
   {
-    const int buffer_id = bid; // medium_buffers_reordering[bid];
+    const int buffer_id = medium_buffers_reordering[bid];
 
     auto in = reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
     auto out = reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
@@ -592,8 +617,8 @@ __global__ void partitioned_kernel(
       cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
 
       underlying_type thread_data[items_per_thread];
-      BlockLoadT(storage.load).Load(in_iterator, thread_data);
-      BlockStoreT(storage.store).Store(out_iterator, thread_data);
+      BlockLoadT(storage.block_load).Load(in_iterator, thread_data);
+      BlockStoreT(storage.block_store).Store(out_iterator, thread_data);
 
       in += tile_size;
       out += tile_size;
@@ -639,8 +664,8 @@ __global__ void partitioned_kernel(
           cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
 
           underlying_type thread_data[items_per_thread];
-          BlockLoadT(storage.load).Load(in_iterator, thread_data);
-          BlockStoreT(storage.store).Store(out_iterator, thread_data);
+          BlockLoadT(storage.block_load).Load(in_iterator, thread_data);
+          BlockStoreT(storage.block_store).Store(out_iterator, thread_data);
         }
 
         if (threadIdx.x == 0)
@@ -651,6 +676,34 @@ __global__ void partitioned_kernel(
         __syncthreads();
         tiles_copied = tiles_copied_cache;
       }
+    }
+  }
+
+  constexpr unsigned int warp_tile_size = warp_size * items_per_thread;
+  const unsigned int warp_id = (BlockThreads * blockIdx.x + threadIdx.x) / warp_size;
+  const unsigned int total_warps = (BlockThreads * gridDim.x) / warp_size;
+
+  for (unsigned int bid = warp_id; bid < small_buffers; bid += total_warps)
+  {
+    const int buffer_id = small_buffers_reordering[bid];
+
+    auto in = reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
+    auto out = reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
+    const auto size             = sizes[buffer_id];
+    const auto size_in_elements = size / sizeof(underlying_type);
+    const auto tiles            = size_in_elements / warp_tile_size;
+
+    for (std::size_t tile = 0; tile < tiles; tile++)
+    {
+      cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS, underlying_type> in_iterator(in);
+      cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS, underlying_type> out_iterator(out);
+
+      underlying_type thread_data[items_per_thread];
+      WarpLoadT(storage.warp_load).Load(in_iterator, thread_data);
+      WarpStoreT(storage.warp_store).Store(out_iterator, thread_data);
+
+      in += warp_tile_size;
+      out += warp_tile_size;
     }
   }
 }
@@ -745,6 +798,7 @@ void measure_partition(const Input<DataT, OffsetT> &input)
                                    d_group_sizes,
                                    large,
                                    medium,
+                                   d_small_and_large,
                                    d_queue_and_medium,
 
                                    input.get_input(),
@@ -773,13 +827,13 @@ int main()
   const int tile_size = items_per_thread * block_threads;
 
   const auto input = Input<std::uint32_t, std::uint32_t>(
-    gen_uniform_buffer_sizes<std::uint32_t>(1024 * 1024, tile_size));
+    gen_uniform_buffer_sizes<std::uint32_t>(1024 * 1024, 32));
 
   // 1024 * 1024 buffers of 256 elements => 46%
   // 1024 buffers of 1024 * 1024 elements => 78%
   // 2 buffers of 256 * 1024 * 1024 elements => 79%
   measure_cub(input);
-  measure_naive(input);
+  // measure_naive(input);
   // measure_large(input);
   measure_memcpy(input);
 
