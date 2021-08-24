@@ -564,7 +564,7 @@ __global__ void partitioned_kernel(
   const int *d_group_sizes,
   LargeBuffersReorderingT large_buffers_reordering,
   MediumBuffersReorderingT medium_buffers_reordering,
-  int *small_buffers_reordering,
+  const int *small_buffers_reordering,
   int *tiles_copied_ptr,
 
   void **in_pointers,
@@ -575,7 +575,7 @@ __global__ void partitioned_kernel(
 
   const unsigned int large_buffers = d_group_sizes[0];
   const unsigned int small_buffers = d_group_sizes[1];
-  const unsigned int medium_buffers = num_buffers - large_buffers - small_buffers;
+  const unsigned int medium_buffers = num_buffers - (large_buffers + small_buffers);
 
   constexpr int items_per_thread  = 4;
   constexpr int tile_size         = items_per_thread * BlockThreads;
@@ -594,14 +594,6 @@ __global__ void partitioned_kernel(
                     cub::BlockStoreAlgorithm::BLOCK_STORE_VECTORIZE>;
 
   constexpr int warp_size = 4;
-
-  /*
-   *
-template <typename          InputT,
-          int               ITEMS_PER_THREAD,
-          WarpLoadAlgorithm ALGORITHM            = WARP_LOAD_DIRECT,
-          int               LOGICAL_WARP_THREADS = CUB_PTX_WARP_THREADS,
-   */
 
   using WarpLoadT = cub::WarpLoad<underlying_type,
                                   items_per_thread,
@@ -629,12 +621,7 @@ template <typename          InputT,
 
     auto in = reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
     auto out = reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
-    const auto size             = sizes[buffer_id];
-
-    if (size == 0)
-    {
-      continue;
-    }
+    const auto size = sizes[buffer_id];
 
     const auto size_in_elements = size / sizeof(underlying_type);
     const auto tiles            = (size_in_elements + tile_size - 1) / tile_size;
@@ -678,7 +665,7 @@ template <typename          InputT,
 
       if (threadIdx.x == 0)
       {
-        tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+        tiles_copied_cache = atomicAdd(tiles_copied_ptr + bid,
                                        tiles_per_request);
       }
       __syncthreads();
@@ -733,7 +720,7 @@ template <typename          InputT,
         {
           if (threadIdx.x == 0)
           {
-            tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+            tiles_copied_cache = atomicAdd(tiles_copied_ptr + bid,
                                            tiles_per_request);
           }
           __syncthreads();
@@ -820,8 +807,8 @@ void measure_partition(const Input<DataT, OffsetT> &input)
                            medium,
                            d_group_sizes,
                            num_buffers,
-                           small_selector,
-                           large_selector);
+                           large_selector,
+                           small_selector);
 
   thrust::device_vector<std::uint8_t> temp_storage(temp_storage_bytes);
   std::uint8_t *d_temp_storage = thrust::raw_pointer_cast(temp_storage.data());
@@ -897,12 +884,12 @@ int main()
 {
   const auto input = Input<std::uint32_t, std::uint32_t>(
     gen_shuffled_buffer_sizes<std::uint32_t>(
-      1024 * 128, // small
-      0, // medium
-      300, // large,
-      4 * 4 * 8,
-      256 * 4 * 16,
-      2 * 1024 * 1024));
+      0, // small
+      2, // medium
+      1, // large,
+      96,
+      8 * 1024,
+      32 * 1024 * 1024));
 
   // 1024 * 1024 buffers of 256 elements => 46%
   // 1024 buffers of 1024 * 1024 elements => 78%
