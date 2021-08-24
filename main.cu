@@ -3,6 +3,7 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
+#include "cub/device/device_partition.cuh"
 #include "cub/iterator/cache_modified_input_iterator.cuh"
 #include "cub/iterator/cache_modified_output_iterator.cuh"
 #include "cub/device/device_batch_memcpy.cuh"
@@ -473,9 +474,252 @@ void measure_memcpy(const Input<DataT, OffsetT> &input)
 
   report_result(ms, input);
 
-    cudaEventDestroy(end);
-    cudaEventDestroy(begin);
+  cudaEventDestroy(end);
+  cudaEventDestroy(begin);
+}
+
+
+template <typename OffsetT>
+struct LargeSegmentsSelectorT
+{
+  OffsetT value{};
+  const OffsetT *d_sizes{};
+
+  __host__ __device__ __forceinline__
+  LargeSegmentsSelectorT(OffsetT value,
+                         const OffsetT *d_sizes)
+    : value(value)
+    , d_sizes(d_sizes)
+  {}
+
+  __host__ __device__ __forceinline__ bool
+  operator()(int segment_id) const
+  {
+    return d_sizes[segment_id] > value;
   }
+};
+
+
+template <typename OffsetT>
+struct SmallSegmentsSelectorT
+{
+  OffsetT value{};
+  const OffsetT *d_sizes{};
+
+  __host__ __device__ __forceinline__
+  SmallSegmentsSelectorT(OffsetT value,
+                         const OffsetT *d_sizes)
+    : value(value)
+    , d_sizes(d_sizes)
+  {}
+
+  __host__ __device__ __forceinline__ bool
+  operator()(unsigned int segment_id) const
+  {
+    return d_sizes[segment_id] < value;
+  }
+};
+
+template <int BlockThreads,
+          typename LargeBuffersReorderingT,
+          typename OffsetT>
+__launch_bounds__(BlockThreads)
+__global__ void partitioned_kernel(
+  int large_buffers,
+  LargeBuffersReorderingT large_buffers_reordering,
+  int *tiles_copied_ptr,
+
+  void **in_pointers,
+  void **out_pointers,
+  const OffsetT *sizes)
+{
+  using underlying_type = std::uint32_t;
+
+  constexpr int items_per_thread  = 4;
+  constexpr int tile_size         = items_per_thread * BlockThreads;
+  constexpr int tiles_per_request = 2;
+
+  using BlockLoadT =
+    cub::BlockLoad<underlying_type,
+                   BlockThreads,
+                   items_per_thread,
+                   cub::BlockLoadAlgorithm::BLOCK_LOAD_VECTORIZE>;
+
+  using BlockStoreT =
+    cub::BlockStore<underlying_type,
+                    BlockThreads,
+                    items_per_thread,
+                    cub::BlockStoreAlgorithm::BLOCK_STORE_VECTORIZE>;
+
+  __shared__ union
+  {
+    typename BlockLoadT::TempStorage load;
+    typename BlockStoreT::TempStorage store;
+
+  } storage;
+
+  const int buffer_id =
+    large_buffers_reordering[static_cast<int>(blockIdx.x) % large_buffers];
+
+  auto in_origin = reinterpret_cast<underlying_type *>(in_pointers[buffer_id]);
+  auto out_origin =
+    reinterpret_cast<underlying_type *>(out_pointers[buffer_id]);
+  const auto size             = sizes[buffer_id];
+  const auto size_in_elements = size / sizeof(underlying_type);
+  const auto tiles            = size_in_elements / tile_size;
+
+  __shared__ int tiles_copied_cache;
+
+  if (threadIdx.x == 0)
+  {
+    tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+                                   tiles_per_request);
+  }
+  __syncthreads();
+  int tiles_copied = tiles_copied_cache;
+
+  while (tiles_copied < tiles)
+  {
+    for (std::size_t tile = 0; tile < tiles_per_request; tile++)
+    {
+      if (tile + tiles_copied >= tiles)
+      {
+        break;
+      }
+
+      const OffsetT tile_offset = (tile + tiles_copied) * tile_size;
+      const auto in             = in_origin + tile_offset;
+      const auto out            = out_origin + tile_offset;
+
+      cub::CacheModifiedInputIterator<cub::CacheLoadModifier::LOAD_CS,
+                                      underlying_type>
+        in_iterator(in);
+      cub::CacheModifiedOutputIterator<cub::CacheStoreModifier::STORE_CS,
+                                       underlying_type>
+        out_iterator(out);
+
+      underlying_type thread_data[items_per_thread];
+      BlockLoadT(storage.load).Load(in_iterator, thread_data);
+      BlockStoreT(storage.store).Store(out_iterator, thread_data);
+    }
+
+    if (threadIdx.x == 0)
+    {
+      tiles_copied_cache = atomicAdd(tiles_copied_ptr + buffer_id,
+                                     tiles_per_request);
+    }
+    __syncthreads();
+    tiles_copied = tiles_copied_cache;
+  }
+}
+
+template <typename DataT,
+  typename OffsetT>
+void measure_partition(const Input<DataT, OffsetT> &input)
+{
+  const std::size_t num_buffers = input.get_num_buffers();
+
+  thrust::counting_iterator<int> buffer_ids(0);
+
+  thrust::device_vector<int> small_and_large(num_buffers);
+  thrust::device_vector<int> queue_and_medium(num_buffers);
+
+  int *d_small_and_large = thrust::raw_pointer_cast(small_and_large.data());
+  int *d_queue_and_medium = thrust::raw_pointer_cast(queue_and_medium.data());
+
+  auto medium = thrust::make_reverse_iterator(d_queue_and_medium + num_buffers);
+  auto large = thrust::make_reverse_iterator(d_small_and_large + num_buffers);
+
+  const OffsetT *d_sizes = input.get_buffer_sizes();
+
+  const OffsetT small_segment_max_size = 1024; // bytes
+  SmallSegmentsSelectorT<OffsetT> small_selector(small_segment_max_size, d_sizes);
+
+  const OffsetT large_segment_min_size = 1024 * 1024; // bytes
+  LargeSegmentsSelectorT<OffsetT> large_selector(large_segment_min_size, d_sizes);
+
+  thrust::device_vector<int> group_sizes(2);
+  int *d_group_sizes = thrust::raw_pointer_cast(group_sizes.data());
+
+
+  std::size_t temp_storage_bytes;
+  cub::DevicePartition::If(nullptr,
+                           temp_storage_bytes,
+                           buffer_ids,
+                           large,
+                           d_small_and_large,
+                           medium,
+                           d_group_sizes,
+                           num_buffers,
+                           small_selector,
+                           large_selector);
+
+  thrust::device_vector<std::uint8_t> temp_storage(temp_storage_bytes);
+  std::uint8_t *d_temp_storage = thrust::raw_pointer_cast(temp_storage.data());
+
+
+  cudaEvent_t begin, end;
+  cudaEventCreate(&begin);
+  cudaEventCreate(&end);
+
+
+  input.fill_input(DataT{35});
+  input.fill_output(DataT{2});
+
+  cudaEventRecord(begin);
+
+  constexpr int block_threads = 256;
+
+  int dev_id = 0;
+  int sm_count;
+  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev_id);
+
+  // Get SM occupancy for the batch memcpy block-level buffers kernel
+  int max_occupancy;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &max_occupancy,
+    partitioned_kernel<block_threads, decltype(large), OffsetT>,
+    block_threads,
+    0);
+
+  const int grid_size = max_occupancy * sm_count;
+
+  cudaMemsetAsync(d_queue_and_medium, 0, sizeof(int) * num_buffers);
+
+  cub::DevicePartition::If(d_temp_storage,
+                           temp_storage_bytes,
+                           buffer_ids,
+                           large,
+                           d_small_and_large,
+                           medium,
+                           d_group_sizes,
+                           num_buffers,
+                           small_selector,
+                           large_selector);
+
+  partitioned_kernel<block_threads, decltype(large), OffsetT>
+    <<<grid_size, block_threads>>>(num_buffers,
+                                   large,
+                                   d_queue_and_medium,
+
+                                   input.get_input(),
+                                   input.get_output(),
+                                   input.get_buffer_sizes());
+
+  cudaEventRecord(end);
+  cudaEventSynchronize(end);
+
+  float ms{};
+  cudaEventElapsedTime(&ms, begin, end);
+
+  input.compare();
+
+  report_result(ms, input);
+
+  cudaEventDestroy(end);
+  cudaEventDestroy(begin);
+}
+
 
 int main()
 {
@@ -493,6 +737,8 @@ int main()
   measure_naive(input);
   measure_large(input);
   measure_memcpy(input);
+
+  measure_partition(input);
 
   return 0;
 }
