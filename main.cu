@@ -52,6 +52,22 @@ thrust::host_vector<T> gen_shuffled_buffer_sizes(std::size_t small_buffers,
   return sizes;
 }
 
+
+template <typename DataT,
+          typename OffsetT>
+__global__ void fill_kernel(void **pointers,
+                            const OffsetT *sizes)
+{
+  const OffsetT size = sizes[blockIdx.x] / sizeof(DataT);
+  DataT *data = reinterpret_cast<DataT*>(pointers[blockIdx.x]);
+
+  for (std::size_t i = threadIdx.x; i < size; i += blockDim.x)
+  {
+    data[i] = static_cast<DataT>(blockIdx.x);
+  }
+}
+
+
 template <typename DataT, typename OffsetT>
 class Input
 {
@@ -100,9 +116,10 @@ public:
     buffer_sizes = h_buffer_sizes;
   }
 
-  void fill_input(DataT value) const
+  void fill_input() const
   {
-    thrust::fill(input.begin(), input.end(), value);
+    fill_kernel<DataT, OffsetT>
+      <<<get_num_buffers(), 256>>>(get_input(), get_buffer_sizes());
   }
 
   void fill_output(DataT value) const
@@ -185,7 +202,7 @@ void report_result(float ms, const Input<DataT, OffsetT> &input)
 
 template <typename DataT,
           typename OffsetT>
-void measure_cub(const Input<DataT, OffsetT> &input)
+float measure_cub(const Input<DataT, OffsetT> &input)
 {
   std::size_t temp_storage_bytes {};
   cub::DeviceBatchMemcpy(nullptr,
@@ -198,7 +215,7 @@ void measure_cub(const Input<DataT, OffsetT> &input)
   thrust::device_vector<std::uint8_t> temp_storage(temp_storage_bytes);
   std::uint8_t *d_temp_storage = thrust::raw_pointer_cast(temp_storage.data());
 
-  input.fill_input(DataT{42});
+  input.fill_input();
   input.fill_output(DataT{1});
 
   cudaEvent_t begin, end;
@@ -222,10 +239,12 @@ void measure_cub(const Input<DataT, OffsetT> &input)
 
   input.compare();
 
-  report_result(ms, input);
+  // report_result(ms, input);
 
   cudaEventDestroy(end);
   cudaEventDestroy(begin);
+
+  return ms;
 }
 
 
@@ -429,7 +448,7 @@ void measure_large(const Input<DataT, OffsetT> &input)
   thrust::device_vector<int> tiles_copied(input.get_num_buffers());
   int *d_tiles_copied = thrust::raw_pointer_cast(tiles_copied.data());
 
-  input.fill_input(DataT{24});
+  input.fill_input();
   input.fill_output(DataT{1});
 
 
@@ -481,14 +500,14 @@ void measure_large(const Input<DataT, OffsetT> &input)
 
 template <typename DataT,
           typename OffsetT>
-void measure_memcpy(const Input<DataT, OffsetT> &input)
+float measure_memcpy(const Input<DataT, OffsetT> &input)
 {
   cudaEvent_t begin, end;
   cudaEventCreate(&begin);
   cudaEventCreate(&end);
 
 
-  input.fill_input(DataT{24});
+  input.fill_input();
   input.fill_output(DataT{1});
 
   cudaEventRecord(begin);
@@ -506,10 +525,12 @@ void measure_memcpy(const Input<DataT, OffsetT> &input)
 
   input.compare();
 
-  report_result(ms, input);
+  // report_result(ms, input);
 
   cudaEventDestroy(end);
   cudaEventDestroy(begin);
+
+  return ms;
 }
 
 
@@ -771,7 +792,7 @@ __global__ void partitioned_kernel(
 
 template <typename DataT,
           typename OffsetT>
-void measure_partition(const Input<DataT, OffsetT> &input)
+float measure_partition(const Input<DataT, OffsetT> &input)
 {
   const std::size_t num_buffers = input.get_num_buffers();
 
@@ -819,7 +840,7 @@ void measure_partition(const Input<DataT, OffsetT> &input)
   cudaEventCreate(&end);
 
 
-  input.fill_input(DataT{35});
+  input.fill_input();
   input.fill_output(DataT{2});
 
   cudaEventRecord(begin);
@@ -873,15 +894,33 @@ void measure_partition(const Input<DataT, OffsetT> &input)
 
   input.compare();
 
-  report_result(ms, input);
+  // report_result(ms, input);
 
   cudaEventDestroy(end);
   cudaEventDestroy(begin);
+
+  return ms;
 }
 
 
 int main()
 {
+  for (std::size_t power_of_two = 12; power_of_two < 30; power_of_two += 2)
+  {
+    const std::size_t buffers = 1ull << power_of_two;
+
+    const auto input = Input<std::uint64_t, std::uint32_t>(
+      gen_uniform_buffer_sizes<std::uint32_t>(buffers, 2));
+
+    const float partition_ms = measure_partition(input);
+    const float cub_ms = measure_cub(input);
+    const float memcpy_ms = measure_memcpy(input);
+
+    std::cout << memcpy_ms << ", " << cub_ms << ", " << partition_ms << std::endl;
+  }
+
+
+  /*
   const auto input = Input<std::uint32_t, std::uint32_t>(
     gen_shuffled_buffer_sizes<std::uint32_t>(
       2 * 1024 * 1024, // small
@@ -902,6 +941,7 @@ int main()
   measure_memcpy(input);
 
   measure_partition(input);
+   */
 
   return 0;
 }
