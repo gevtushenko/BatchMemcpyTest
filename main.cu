@@ -67,6 +67,27 @@ __global__ void fill_kernel(void **pointers,
   }
 }
 
+template <typename OffsetT>
+__global__ void reorder_kernel(const unsigned int buffers,
+                               const int *reordering,
+                               void **in_pointers_original,
+                               void **in_pointers,
+                               void **out_pointers_original,
+                               void **out_pointers,
+                               const OffsetT *sizes_original,
+                               OffsetT *sizes)
+{
+  const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (i < buffers)
+  {
+    const int final_position = reordering[i];
+    in_pointers[final_position] = in_pointers_original[i];
+    out_pointers[final_position] = out_pointers_original[i];
+    sizes[final_position] = sizes_original[i];
+  }
+}
+
 
 template <typename DataT, typename OffsetT>
 class Input
@@ -87,6 +108,7 @@ public:
     : buffers(h_buffer_sizes.size())
     , in_pointers(buffers)
     , out_pointers(buffers)
+    , buffer_sizes(buffers)
   {
     total_input_size = thrust::reduce(h_buffer_sizes.begin(),
                                       h_buffer_sizes.end());
@@ -111,9 +133,25 @@ public:
       h_buffer_sizes[buffer] *= sizeof(DataT);
     }
 
-    in_pointers = h_in_pointers;
-    out_pointers = h_out_pointers;
-    buffer_sizes = h_buffer_sizes;
+    thrust::device_vector<void*> in_pointers_original(h_in_pointers);
+    thrust::device_vector<void*> out_pointers_original(h_out_pointers);
+    thrust::device_vector<OffsetT> buffer_sizes_original(h_buffer_sizes);
+
+    thrust::device_vector<int> reordering(get_num_buffers());
+    thrust::sequence(reordering.begin(), reordering.end());
+    thrust::default_random_engine re;
+    thrust::shuffle(reordering.begin(), reordering.end(), re);
+
+    const unsigned int grid_size = (buffers + 256 - 1) / 256;
+    reorder_kernel<OffsetT><<<grid_size, 256>>>(
+      get_num_buffers(),
+      thrust::raw_pointer_cast(reordering.data()),
+      thrust::raw_pointer_cast(in_pointers_original.data()),
+      get_input(),
+      thrust::raw_pointer_cast(out_pointers_original.data()),
+      get_output(),
+      thrust::raw_pointer_cast(buffer_sizes_original.data()),
+      get_buffer_sizes());
   }
 
   void fill_input() const
@@ -165,9 +203,9 @@ public:
     return const_cast<DataT*>(thrust::raw_pointer_cast(output.data()));
   }
 
-  const OffsetT* get_buffer_sizes() const
+  OffsetT* get_buffer_sizes() const
   {
-    return thrust::raw_pointer_cast(buffer_sizes.data());
+    return const_cast<OffsetT*>(thrust::raw_pointer_cast(buffer_sizes.data()));
   }
 
   std::size_t get_num_buffers() const
@@ -905,12 +943,12 @@ float measure_partition(const Input<DataT, OffsetT> &input)
 
 int main()
 {
-  for (std::size_t power_of_two = 12; power_of_two < 30; power_of_two += 2)
+  for (std::size_t power_of_two = 12; power_of_two < 28; power_of_two += 2)
   {
     const std::size_t buffers = 1ull << power_of_two;
 
     const auto input = Input<std::uint64_t, std::uint32_t>(
-      gen_uniform_buffer_sizes<std::uint32_t>(buffers, 2));
+      gen_uniform_buffer_sizes<std::uint32_t>(buffers, 8));
 
     const float partition_ms = measure_partition(input);
     const float cub_ms = measure_cub(input);
